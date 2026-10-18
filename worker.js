@@ -2,89 +2,99 @@ export default {
   async fetch(request, env) {
     const url = new URL(request.url);
 
-    // Création automatique de la table SQL au premier appel
-    if (env.DB) {
-      await env.DB.prepare(`
-        CREATE TABLE IF NOT EXISTS quotes (
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          provider TEXT,
-          tech TEXT,
-          bandwidth TEXT,
-          monthlyPrice REAL,
-          setupFee REAL,
-          promoPrice REAL,
-          promoMonths INTEGER,
-          commitment INTEGER,
-          sla TEXT,
-          backup TEXT,
-          createdAt DATETIME DEFAULT CURRENT_TIMESTAMP
-        )
-      `).run();
+    // 1. Initialisation sécurisée de la table SQL D1 (sur une seule ligne, sans jamais bloquer la page)
+    if (env && env.DB) {
+      try {
+        await env.DB.prepare("CREATE TABLE IF NOT EXISTS quotes (id INTEGER PRIMARY KEY AUTOINCREMENT, provider TEXT, tech TEXT, bandwidth TEXT, monthlyPrice REAL, setupFee REAL, promoPrice REAL, promoMonths INTEGER, commitment INTEGER, sla TEXT, backup TEXT, createdAt DATETIME DEFAULT CURRENT_TIMESTAMP)").run();
+      } catch (e) {
+        console.error("Erreur init D1:", e.message);
+      }
     }
 
-    // --- API GROUPE 1 : EXTRACTION IA D'UN DEVIS BRUT + ENREGISTREMENT EN BDD ---
+    // 2. Route de vérification de l'état de l'IA et de la Base D1
+    if (url.pathname === "/api/status") {
+      return new Response(JSON.stringify({
+        aiConnected: !!(env && env.AI),
+        dbConnected: !!(env && env.DB)
+      }), { headers: { "Content-Type": "application/json" } });
+    }
+
+    // 3. API GROUPE 1 : EXTRACTION IA D'UN DEVIS BRUT
     if (url.pathname === "/api/extract" && request.method === "POST") {
       try {
+        if (!env || !env.AI) {
+          return new Response(JSON.stringify({ success: false, error: "Le Binding AI n'est pas détecté." }), { status: 400, headers: { "Content-Type": "application/json" } });
+        }
         const { rawText } = await request.json();
-        const prompt = `Tu es un expert Télécom. Extrais les informations de ce devis et réponds UNIQUEMENT avec un objet JSON valide (sans texte avant ni après, sans balises markdown) respectant exactement cette structure :
-{"provider": "Nom opérateur et offre", "tech": "FTTO ou FTTH ou 5G ou Mobile", "bandwidth": "Débit ex 1 Gbps", "monthlyPrice": 350, "setupFee": 0, "promoPrice": 0, "promoMonths": 0, "commitment": 36, "sla": "GTR 4h ou GTR 8h ou Best Effort", "backup": "Oui ou Non"}
-Voici le texte du devis : ${rawText}`;
+        const prompt = `Tu es un expert Télécom. Extrais les informations de ce devis et réponds UNIQUEMENT avec un objet JSON valide respectant exactement cette structure :
+{"provider": "Nom opérateur et offre", "tech": "FTTO ou FTTH ou 5G", "bandwidth": "1 Gbps", "monthlyPrice": 350, "setupFee": 0, "promoPrice": 0, "promoMonths": 0, "commitment": 36, "sla": "GTR 4h", "backup": "Oui"}
+Devis : ${rawText}`;
 
         const aiResp = await env.AI.run("@cf/meta/llama-3.1-8b-instruct", {
           messages: [{ role: "user", content: prompt }],
           temperature: 0.1
         });
 
-        // Nettoyage et lecture du JSON généré par l'IA
-        const jsonMatch = aiResp.response.match(/\{[\s\S]*\}/);
-        const data = JSON.parse(jsonMatch ? jsonMatch[0] : aiResp.response);
+        const textOut = aiResp.response || JSON.stringify(aiResp);
+        const jsonMatch = textOut.match(/\{[\s\S]*\}/);
+        const data = JSON.parse(jsonMatch ? jsonMatch[0] : textOut);
 
         return new Response(JSON.stringify({ success: true, extracted: data }), {
           headers: { "Content-Type": "application/json" }
         });
       } catch (err) {
-        return new Response(JSON.stringify({ success: false, error: err.message }), { status: 500 });
+        return new Response(JSON.stringify({ success: false, error: err.message }), { status: 500, headers: { "Content-Type": "application/json" } });
       }
     }
 
-    // --- API : SAUVEGARDER OU LIRE LES DEVIS DANS LA BASE DE DONNÉES (D1) ---
+    // 4. API : SAUVEGARDER OU LIRE LES DEVIS DANS LA BASE DE DONNÉES (D1)
     if (url.pathname === "/api/quotes") {
-      if (request.method === "GET") {
-        const { results } = await env.DB.prepare("SELECT * FROM quotes ORDER BY id DESC").all();
-        return new Response(JSON.stringify(results), { headers: { "Content-Type": "application/json" } });
-      }
-      if (request.method === "POST") {
-        const q = await request.json();
-        await env.DB.prepare(`
-          INSERT INTO quotes (provider, tech, bandwidth, monthlyPrice, setupFee, promoPrice, promoMonths, commitment, sla, backup)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        `).bind(q.provider, q.tech, q.bandwidth, q.monthlyPrice, q.setupFee, q.promoPrice || 0, q.promoMonths || 0, q.commitment, q.sla, q.backup).run();
-        return new Response(JSON.stringify({ success: true }), { headers: { "Content-Type": "application/json" } });
-      }
-      if (request.method === "DELETE") {
-        const id = url.searchParams.get("id");
-        if (id) {
-          await env.DB.prepare("DELETE FROM quotes WHERE id = ?").bind(id).run();
-        } else {
-          await env.DB.prepare("DELETE FROM quotes").run();
+      try {
+        if (!env || !env.DB) {
+          return new Response(JSON.stringify([]), { headers: { "Content-Type": "application/json" } });
         }
-        return new Response(JSON.stringify({ success: true }));
+        if (request.method === "GET") {
+          const { results } = await env.DB.prepare("SELECT * FROM quotes ORDER BY id DESC").all();
+          return new Response(JSON.stringify(results || []), { headers: { "Content-Type": "application/json" } });
+        }
+        if (request.method === "POST") {
+          const q = await request.json();
+          await env.DB.prepare("INSERT INTO quotes (provider, tech, bandwidth, monthlyPrice, setupFee, promoPrice, promoMonths, commitment, sla, backup) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+            .bind(q.provider, q.tech, q.bandwidth, q.monthlyPrice, q.setupFee, q.promoPrice || 0, q.promoMonths || 0, q.commitment, q.sla, q.backup)
+            .run();
+          return new Response(JSON.stringify({ success: true }), { headers: { "Content-Type": "application/json" } });
+        }
+        if (request.method === "DELETE") {
+          const id = url.searchParams.get("id");
+          if (id) {
+            await env.DB.prepare("DELETE FROM quotes WHERE id = ?").bind(id).run();
+          } else {
+            await env.DB.prepare("DELETE FROM quotes").run();
+          }
+          return new Response(JSON.stringify({ success: true }), { headers: { "Content-Type": "application/json" } });
+        }
+      } catch (err) {
+        return new Response(JSON.stringify({ error: err.message }), { status: 500, headers: { "Content-Type": "application/json" } });
       }
     }
 
-    // --- API GROUPE 2 : COMPARAISON INTELLIGENTE DES DEVIS PAR L'IA ---
+    // 5. API GROUPE 2 : COMPARAISON INTELLIGENTE DES DEVIS PAR L'IA
     if (url.pathname === "/api/compare-ai" && request.method === "POST") {
-      const { quotes } = await request.json();
-      const prompt = `Tu es un consultant Télécom B2B. Compare ces offres (en tenant compte du TCO lissé, des FAS, de la technologie FTTO dédiée vs FTTH mutualisée, et de la GTR). Rédige une recommandation claire en 3 points courts (1. Analyse financière TCO, 2. Analyse technique & risques, 3. Verdict final) en français : ${JSON.stringify(quotes)}`;
-      const aiResp = await env.AI.run("@cf/meta/llama-3.1-8b-instruct", {
-        messages: [{ role: "user", content: prompt }]
-      });
-      return new Response(JSON.stringify({ analysis: aiResp.response }), {
-        headers: { "Content-Type": "application/json" }
-      });
+      try {
+        const { quotes } = await request.json();
+        const prompt = `Tu es un consultant Télécom B2B. Compare ces offres (TCO lissé, FAS, FTTO dédiée vs FTTH mutualisée, GTR). Rédige une recommandation claire en 3 points courts en français : ${JSON.stringify(quotes)}`;
+        const aiResp = await env.AI.run("@cf/meta/llama-3.1-8b-instruct", {
+          messages: [{ role: "user", content: prompt }]
+        });
+        return new Response(JSON.stringify({ analysis: aiResp.response }), {
+          headers: { "Content-Type": "application/json" }
+        });
+      } catch (err) {
+        return new Response(JSON.stringify({ analysis: "Erreur IA : " + err.message }), { status: 500, headers: { "Content-Type": "application/json" } });
+      }
     }
 
-    // --- INTERFACE WEB (DIVISÉE EN PÔLE 1 : EXTRACTION & PÔLE 2 : COMPARAISON) ---
+    // 6. AFFICHAGE DE L'APPLICATION WEB
     return new Response(HTML_PAGE, { headers: { "content-type": "text/html;charset=UTF-8" } });
   }
 };
@@ -106,7 +116,9 @@ const HTML_PAGE = `<!DOCTYPE html>
                 <i class="fa-solid fa-tower-cell text-2xl text-indigo-400"></i>
                 <div>
                     <h1 class="text-xl font-bold">TelecomCompare AI + Base SQL</h1>
-                    <p class="text-xs text-indigo-200">Module 1 : Extraction IA vers BDD D1 | Module 2 : Comparateur TCO & Arbitrage IA</p>
+                    <div id="statusBadges" class="flex gap-2 mt-1 text-[10px]">
+                        <span class="bg-slate-700 px-2 py-0.5 rounded">Vérification IA & BDD...</span>
+                    </div>
                 </div>
             </div>
             <div class="space-x-2">
@@ -121,8 +133,6 @@ const HTML_PAGE = `<!DOCTYPE html>
     </header>
 
     <main class="max-w-7xl mx-auto px-4 py-6 grid grid-cols-1 lg:grid-cols-12 gap-8">
-        
-        <!-- GROUPE 1 : EXTRACTION IA & ENREGISTREMENT EN BASE -->
         <section class="lg:col-span-5 space-y-6">
             <div class="bg-indigo-50 p-5 rounded-xl border border-indigo-200 shadow-sm">
                 <span class="text-[10px] font-bold uppercase bg-indigo-600 text-white px-2 py-0.5 rounded">Mission Groupe 1</span>
@@ -130,7 +140,7 @@ const HTML_PAGE = `<!DOCTYPE html>
                     <i class="fa-solid fa-wand-magic-sparkles text-indigo-600 mr-1"></i> Extracteur IA de Devis Brut
                 </h2>
                 <p class="text-xs text-indigo-700 mb-3">Collez le texte d'un email ou PDF opérateur : l'IA extrait les données et remplit le formulaire.</p>
-                <textarea id="rawQuoteText" rows="4" class="w-full rounded-lg border-indigo-300 border p-2.5 text-xs bg-white" placeholder="Exemple : Proposition Bouygues Telecom Entreprises pour une Fibre Dédiée FTTO 1 Gbps symétrique. Tarif mensuel de 340 € HT/mois (avec promotion à 200 € HT pendant les 6 premiers mois). Engagement 36 mois, Frais d'accès (FAS) de 250 €. Garantie GTR 4h 24/7 et Backup 4G automatique inclus."></textarea>
+                <textarea id="rawQuoteText" rows="4" class="w-full rounded-lg border-indigo-300 border p-2.5 text-xs bg-white" placeholder="Cliquez sur 'Exemple texte' ci-dessous..."></textarea>
                 <div class="flex gap-2 mt-2">
                     <button onclick="fillSampleText()" type="button" class="w-1/3 bg-white hover:bg-indigo-100 text-indigo-700 border border-indigo-300 text-xs font-semibold py-2 rounded-lg">
                         Exemple texte
@@ -141,7 +151,6 @@ const HTML_PAGE = `<!DOCTYPE html>
                 </div>
             </div>
 
-            <!-- Formulaire relié à la Base SQL D1 -->
             <div class="bg-white p-5 rounded-xl shadow-sm border border-slate-200">
                 <h3 class="text-sm font-bold mb-3 text-slate-800 border-b pb-2">
                     <i class="fa-solid fa-database text-emerald-600 mr-1"></i> Vérification & Envoi vers la Base SQL
@@ -202,7 +211,6 @@ const HTML_PAGE = `<!DOCTYPE html>
             </div>
         </section>
 
-        <!-- GROUPE 2 : COMPARATEUR TCO TEMPS RÉEL & ARBITRAGE IA -->
         <section class="lg:col-span-7 space-y-6">
             <div class="bg-white p-5 rounded-xl border border-slate-200 shadow-sm">
                 <div class="flex justify-between items-center mb-4">
@@ -212,11 +220,9 @@ const HTML_PAGE = `<!DOCTYPE html>
                     </div>
                     <span id="dbCount" class="text-xs bg-slate-100 text-slate-700 px-2.5 py-1 rounded-full font-semibold">0 devis en base</span>
                 </div>
-
                 <div id="quotesContainer" class="grid grid-cols-1 md:grid-cols-2 gap-4"></div>
             </div>
 
-            <!-- Arbitrage IA Llama 3 -->
             <div class="bg-indigo-950 text-white p-6 rounded-xl shadow-md">
                 <div class="flex justify-between items-center mb-3">
                     <h3 class="font-bold text-sm flex items-center text-indigo-200">
@@ -236,6 +242,16 @@ const HTML_PAGE = `<!DOCTYPE html>
     <script>
         let currentQuotes = [];
 
+        async function checkStatus() {
+            try {
+                const res = await fetch('/api/status');
+                const s = await res.json();
+                document.getElementById('statusBadges').innerHTML = 
+                    '<span class="px-2 py-0.5 rounded font-semibold ' + (s.aiConnected ? 'bg-emerald-600' : 'bg-rose-600') + '">IA Llama 3 : ' + (s.aiConnected ? 'Connectée' : 'Non liée') + '</span>' +
+                    '<span class="px-2 py-0.5 rounded font-semibold ' + (s.dbConnected ? 'bg-emerald-600' : 'bg-rose-600') + '">Base SQL D1 : ' + (s.dbConnected ? 'Connectée' : 'Non liée') + '</span>';
+            } catch (e) {}
+        }
+
         function fillSampleText() {
             const samples = [
                 "Devis Orange Business Services : Liaison Fibre Dédiée FTTO 1 Gbps symétrique. Abonnement mensuel de 390 € HT sur 36 mois. Frais d'accès au service (FAS) de 450 € HT. Garantie GTR 4h 24/7 et routeur Backup 4G automatique inclus.",
@@ -246,7 +262,7 @@ const HTML_PAGE = `<!DOCTYPE html>
 
         async function extractWithAI() {
             const rawText = document.getElementById('rawQuoteText').value;
-            if (!rawText.trim()) return alert("Collez d'abord un texte de devis !");
+            if (!rawText.trim()) return alert("Cliquez d'abord sur 'Exemple texte' ou collez un devis !");
             const btn = document.getElementById('btnExtract');
             btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin mr-1"></i> Extraction IA en cours...';
             try {
@@ -269,7 +285,7 @@ const HTML_PAGE = `<!DOCTYPE html>
                     document.getElementById('sla').value = e.sla || 'GTR 4h';
                     document.getElementById('backup').value = e.backup || 'Oui';
                 } else {
-                    alert("Vérifiez que le Binding 'AI' (Workers AI) est bien activé dans Settings > Bindings.");
+                    alert("Erreur IA : " + (data.error || "Vérifiez le Binding AI"));
                 }
             } catch (err) {
                 alert("Erreur lors de l'appel IA : " + err.message);
@@ -290,13 +306,15 @@ const HTML_PAGE = `<!DOCTYPE html>
             try {
                 const res = await fetch('/api/quotes');
                 const data = await res.json();
-                currentQuotes = data.map(q => {
-                    const m = calculateTCO(q);
-                    return { ...q, tco: m.totalCost, smoothedMonthly: m.smoothedMonthly };
-                });
+                if (Array.isArray(data)) {
+                    currentQuotes = data.map(q => {
+                        const m = calculateTCO(q);
+                        return { ...q, tco: m.totalCost, smoothedMonthly: m.smoothedMonthly };
+                    });
+                }
                 renderQuotes();
             } catch (e) {
-                console.error("Base D1 non connectée ou vide", e);
+                console.error(e);
             }
         }
 
@@ -348,7 +366,7 @@ const HTML_PAGE = `<!DOCTYPE html>
                 const data = await res.json();
                 out.textContent = data.analysis || "Aucune réponse de l'IA.";
             } catch (e) {
-                out.textContent = "Erreur : vérifiez que le Binding 'AI' est bien configuré.";
+                out.textContent = "Erreur : " + e.message;
             }
             btn.innerHTML = '<i class="fa-solid fa-bolt mr-1"></i> Comparer les devis avec l\\'IA';
         }
@@ -382,6 +400,7 @@ const HTML_PAGE = `<!DOCTYPE html>
             });
         }
 
+        checkStatus();
         loadQuotesFromDB();
     </script>
 </body>
